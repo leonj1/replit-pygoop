@@ -8,6 +8,7 @@ to the appropriate LLM provider.
 import os
 import json
 import logging
+import time
 import requests
 from flask import Flask, request, Response, jsonify, stream_with_context
 from typing import Dict, Any, Callable, Tuple, Optional
@@ -23,6 +24,7 @@ from .utils import (
     transform_vertex_to_openai
 )
 from .audit import AuditLogger, create_audit_middleware
+from .telemetry import setup_telemetry, RequestMetrics
 
 # Set up logging
 logger = setup_logger(__name__)
@@ -35,15 +37,26 @@ PROVIDER_ENDPOINTS = {
     'vertex': os.environ.get('VERTEX_AI_ENDPOINT', 'https://us-central1-aiplatform.googleapis.com/v1'),
 }
 
-def create_app() -> Flask:
+def create_app(enable_telemetry: bool = True, prometheus_port: int = 8081) -> Flask:
     """
     Create a Flask application for the PyGoop proxy.
+    
+    Args:
+        enable_telemetry: Whether to enable OpenTelemetry instrumentation.
+        prometheus_port: The port for the Prometheus metrics endpoint.
     
     Returns:
         A Flask application instance.
     """
     app = Flask(__name__)
     audit_logger = AuditLogger()
+    
+    # Set up OpenTelemetry if enabled
+    if enable_telemetry:
+        try:
+            setup_telemetry(app, prometheus_port)
+        except Exception as e:
+            logger.warning(f"Failed to set up telemetry: {str(e)}")
     
     @app.route('/')
     def index():
@@ -79,13 +92,23 @@ def create_app() -> Flask:
             return jsonify({
                 'error': f"Invalid provider. URL path must start with one of: {', '.join(PROVIDER_ENDPOINTS.keys())}"
             }), 400
-            
+        
+        # Start tracking metrics
+        metrics = RequestMetrics(provider, path)
+        
         # Determine the target endpoint and request details
         target_url, method, headers, data = prepare_request(provider, path, request)
         
         if provider == 'openai-proxy':
             # Handle routing through the common OpenAI-compatible interface
-            return handle_openai_proxy_request(request_id, path, request)
+            try:
+                response = handle_openai_proxy_request(request_id, path, request)
+                metrics.record_completion()
+                return response
+            except Exception as e:
+                metrics.record_error(type(e).__name__)
+                metrics.record_completion()
+                raise
         
         logger.info(f"Proxying {method} request to {target_url}")
         
@@ -103,9 +126,14 @@ def create_app() -> Flask:
             is_streaming = check_streaming_request(data)
             
             if is_streaming:
-                return handle_streaming_request(request_id, provider, path, target_url, method, headers, data)
+                metrics.record_streaming()
+                response = handle_streaming_request(request_id, provider, path, target_url, method, headers, data)
+                metrics.record_completion()
+                return response
             else:
-                return handle_standard_request(request_id, provider, path, target_url, method, headers, data)
+                response = handle_standard_request(request_id, provider, path, target_url, method, headers, data)
+                metrics.record_completion()
+                return response
                 
         except Exception as e:
             error_message = str(e)
@@ -118,6 +146,10 @@ def create_app() -> Flask:
                 endpoint=path,
                 error_message=error_message
             )
+            
+            # Record the error metric
+            metrics.record_error(type(e).__name__)
+            metrics.record_completion()
             
             return jsonify({
                 'error': error_message
@@ -453,11 +485,15 @@ def main():
     Main entry point for the PyGoop proxy server.
     """
     port = int(os.environ.get("PORT", 5000))
+    prometheus_port = int(os.environ.get("PROMETHEUS_PORT", 8081))
+    enable_telemetry = os.environ.get("ENABLE_TELEMETRY", "true").lower() == "true"
     
     # Print startup information
     print("\nPyGoop OpenLLM Proxy Server")
     print("==========================\n")
     print(f"Server running at: http://localhost:{port}")
+    if enable_telemetry:
+        print(f"Prometheus metrics available at: http://localhost:{prometheus_port}/metrics")
     print("\nAvailable Endpoints:")
     for provider, endpoint in PROVIDER_ENDPOINTS.items():
         print(f"  /{provider}/... -> {endpoint}")
@@ -471,7 +507,7 @@ def main():
     print("\nUse examples/test_proxy.py to test the proxy server.\n")
     
     # Create and run the app
-    app = create_app()
+    app = create_app(enable_telemetry=enable_telemetry, prometheus_port=prometheus_port)
     app.run(host='0.0.0.0', port=port, debug=True)
 
 

@@ -6,16 +6,21 @@ from pygoop.utils import setup_logger
 # Set up logger
 logger = setup_logger("pygoop", logging.INFO)
 
-# Create the app
-app = create_app()
+# Get configuration from environment variables
+port = int(os.environ.get("PORT", 5000))
+prometheus_port = int(os.environ.get("PROMETHEUS_PORT", 8081))
+enable_telemetry = os.environ.get("ENABLE_TELEMETRY", "true").lower() == "true"
+
+# Create the app with telemetry enabled
+app = create_app(enable_telemetry=enable_telemetry, prometheus_port=prometheus_port)
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    
     # Print startup information
     print("\nPyGoop OpenLLM Proxy Server")
     print("==========================\n")
     print(f"Server running at: http://localhost:{port}")
+    if enable_telemetry:
+        print(f"Prometheus metrics available at: http://localhost:{prometheus_port}/metrics")
     print("\nAvailable Endpoints:")
     for provider, endpoint in PROVIDER_ENDPOINTS.items():
         print(f"  /{provider}/... -> {endpoint}")
