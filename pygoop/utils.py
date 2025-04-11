@@ -5,6 +5,8 @@ Utility functions for the PyGoop library.
 import logging
 import uuid
 import json
+import validators
+from urllib.parse import urlparse, urljoin
 from typing import Optional, Dict, Any, List, Union
 
 logger = logging.getLogger(__name__)
@@ -326,3 +328,50 @@ def transform_vertex_to_openai(vertex_response: Dict[str, Any]) -> Dict[str, Any
             })
     
     return openai_response
+
+
+def is_valid_url(url: str) -> bool:
+    """
+    Check if a URL is valid.
+    
+    Args:
+        url: The URL to check.
+        
+    Returns:
+        True if the URL is valid, False otherwise.
+    """
+    return validators.url(url) is True
+
+
+def clean_url(url: str) -> str:
+    """
+    Clean and normalize a URL.
+    
+    Args:
+        url: The URL to clean.
+        
+    Returns:
+        A cleaned and normalized URL.
+    """
+    if not url:
+        return ""
+        
+    # Add http:// prefix if missing
+    if not url.startswith(('http://', 'https://')):
+        url = 'http://' + url
+        
+    # Parse and normalize the URL
+    parsed = urlparse(url)
+    
+    # Build the normalized URL
+    cleaned_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    
+    # Add query parameters if present
+    if parsed.query:
+        cleaned_url += f"?{parsed.query}"
+        
+    # Add fragment if present
+    if parsed.fragment:
+        cleaned_url += f"#{parsed.fragment}"
+        
+    return cleaned_url

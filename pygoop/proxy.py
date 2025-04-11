@@ -1,452 +1,448 @@
 """
 Proxy module for the PyGoop library.
 
-This module contains the main proxy functionality for routing
-requests to different LLM providers.
+This module contains the proxy functionality that routes requests
+to the appropriate LLM provider.
 """
 
 import os
+import json
 import logging
-from flask import Flask, request, Response, jsonify, stream_with_context
 import requests
-from functools import wraps
+from flask import Flask, request, Response, jsonify, stream_with_context
+from typing import Dict, Any, Callable, Tuple, Optional
 
-logger = logging.getLogger(__name__)
+from .utils import (
+    setup_logger,
+    generate_request_id,
+    filter_sensitive_data,
+    get_provider_from_url,
+    transform_openai_to_bedrock,
+    transform_openai_to_vertex,
+    transform_bedrock_to_openai,
+    transform_vertex_to_openai
+)
+from .audit import AuditLogger, create_audit_middleware
 
-class LLMEngine:
-    """Base class for LLM provider engines."""
-    
-    def __init__(self, base_url, api_key=None):
-        """Initialize an LLM engine.
-        
-        Args:
-            base_url: The base URL for the LLM provider API.
-            api_key: The API key for authenticating with the provider.
-        """
-        self.base_url = base_url
-        self.api_key = api_key
-        
-    def get_headers(self):
-        """Get the headers for making requests to the LLM provider.
-        
-        Returns:
-            A dictionary of headers.
-        """
-        headers = {
-            'Content-Type': 'application/json'
-        }
-        
-        if self.api_key:
-            headers['Authorization'] = f'Bearer {self.api_key}'
-            
-        return headers
-        
-    def proxy_request(self, path, method, headers=None, data=None, stream=False):
-        """Proxy a request to the LLM provider.
-        
-        Args:
-            path: The path to append to the base URL.
-            method: The HTTP method to use.
-            headers: Additional headers to include.
-            data: The request data.
-            stream: Whether to stream the response.
-            
-        Returns:
-            The response from the LLM provider.
-        """
-        url = f"{self.base_url.rstrip('/')}/{path.lstrip('/')}"
-        
-        request_headers = self.get_headers()
-        if headers:
-            # Copy specific headers from the original request
-            for header in ['Content-Type', 'Accept']:
-                if header in headers:
-                    request_headers[header] = headers[header]
-        
-        try:
-            response = requests.request(
-                method=method,
-                url=url,
-                headers=request_headers,
-                json=data,
-                stream=stream
-            )
-            
-            return response
-        except Exception as e:
-            logger.exception(f"Error proxying request to {url}: {str(e)}")
-            return None
-            
-class OpenAIEngine(LLMEngine):
-    """Engine for OpenAI API."""
-    
-    def __init__(self, api_key=None):
-        super().__init__("https://api.openai.com/v1", api_key)
+# Set up logging
+logger = setup_logger(__name__)
 
+# Default endpoints for providers
+PROVIDER_ENDPOINTS = {
+    'openai': os.environ.get('OPENAI_ENDPOINT', 'https://api.openai.com/v1'),
+    'azure': os.environ.get('AZURE_OPENAI_ENDPOINT', 'https://your-resource-name.openai.azure.com'),
+    'bedrock': os.environ.get('AWS_BEDROCK_ENDPOINT', 'https://bedrock-runtime.us-west-2.amazonaws.com'),
+    'vertex': os.environ.get('VERTEX_AI_ENDPOINT', 'https://us-central1-aiplatform.googleapis.com/v1'),
+}
 
-class AzureOpenAIEngine(LLMEngine):
-    """Engine for Azure OpenAI API."""
-    
-    def __init__(self, endpoint, api_key=None):
-        super().__init__(endpoint, api_key)
-        
-    def get_headers(self):
-        headers = super().get_headers()
-        # Azure uses a different header for authentication
-        if self.api_key:
-            headers.pop('Authorization', None)
-            headers['api-key'] = self.api_key
-        return headers
-
-
-class BedrockEngine(LLMEngine):
-    """Engine for AWS Bedrock API."""
-    
-    def __init__(self, aws_region="us-east-1", aws_access_key=None, aws_secret_key=None):
-        super().__init__(f"https://bedrock-runtime.{aws_region}.amazonaws.com/", None)
-        self.aws_region = aws_region
-        self.aws_access_key = aws_access_key
-        self.aws_secret_key = aws_secret_key
-        
-    def proxy_request(self, path, method, headers=None, data=None, stream=False):
-        """Override to add AWS authentication."""
-        # In a real implementation, we would use AWS SDK for authentication
-        # For this example, we'll just pass through the request
-        return super().proxy_request(path, method, headers, data, stream)
-
-
-class VertexAIEngine(LLMEngine):
-    """Engine for Google Vertex AI API."""
-    
-    def __init__(self, project_id, location="us-central1"):
-        super().__init__(f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}", None)
-        self.project_id = project_id
-        self.location = location
-        
-    def proxy_request(self, path, method, headers=None, data=None, stream=False):
-        """Override to add Google authentication."""
-        # In a real implementation, we would use Google SDK for authentication
-        # For this example, we'll just pass through the request
-        return super().proxy_request(path, method, headers, data, stream)
-
-
-class OpenAIProxyEngine(LLMEngine):
-    """Engine for providing OpenAI-compatible interface for other LLM providers."""
-    
-    def __init__(self, provider_engines):
-        super().__init__("", None)
-        self.provider_engines = provider_engines
-        
-    def proxy_request(self, path, method, headers=None, data=None, stream=False):
-        """Route request to the appropriate provider based on the model parameter."""
-        if not data or 'model' not in data:
-            return Response(
-                response='{"error": "model parameter is required"}',
-                status=400,
-                mimetype='application/json'
-            )
-            
-        model = data['model']
-        
-        # Route based on model prefix
-        if model.startswith('bedrock/'):
-            # Extract the actual model ID
-            model_id = model.split('/', 1)[1]
-            
-            # Update data with provider-specific format
-            bedrock_data = {
-                # Convert OpenAI format to Bedrock format
-                "modelId": model_id,
-                "prompt": data.get('prompt', data.get('messages', [])),
-                "max_tokens": data.get('max_tokens', 100),
-                "temperature": data.get('temperature', 0.7),
-                # Add other parameters as needed
-            }
-            
-            return self.provider_engines['bedrock'].proxy_request(
-                path=f"model/{model_id}/invoke",
-                method=method,
-                headers=headers,
-                data=bedrock_data,
-                stream=stream
-            )
-            
-        elif model.startswith('vertex/'):
-            # Extract the actual model ID
-            model_id = model.split('/', 1)[1]
-            
-            # Update data with provider-specific format
-            vertex_data = {
-                # Convert OpenAI format to Vertex AI format
-                "instances": [{
-                    "prompt": data.get('prompt', ''),
-                    "messages": data.get('messages', [])
-                }],
-                "parameters": {
-                    "maxOutputTokens": data.get('max_tokens', 100),
-                    "temperature": data.get('temperature', 0.7),
-                    # Add other parameters as needed
-                }
-            }
-            
-            return self.provider_engines['vertex'].proxy_request(
-                path=f"publishers/google/models/{model_id}:predict",
-                method=method,
-                headers=headers,
-                data=vertex_data,
-                stream=stream
-            )
-            
-        elif model.startswith('azure/'):
-            # Extract the actual model ID
-            model_id = model.split('/', 1)[1]
-            
-            # For Azure, typically retain the OpenAI format but route to Azure endpoint
-            return self.provider_engines['azure'].proxy_request(
-                path=f"openai/deployments/{model_id}/chat/completions",
-                method=method,
-                headers=headers,
-                data=data,
-                stream=stream
-            )
-            
-        else:
-            # Assume it's a standard OpenAI model
-            return self.provider_engines['openai'].proxy_request(
-                path=f"chat/completions",  # or the appropriate endpoint
-                method=method,
-                headers=headers,
-                data=data,
-                stream=stream
-            )
-
-
-def create_audit_middleware():
-    """Create a middleware function for request/response auditing."""
-    
-    def audit_middleware(f):
-        @wraps(f)
-        def decorated_function(*args, **kwargs):
-            # Pre-request hook
-            logger.info(f"Request: {request.method} {request.path}")
-            if request.is_json:
-                logger.debug(f"Request data: {request.get_json()}")
-                
-            # Execute the view function
-            response = f(*args, **kwargs)
-            
-            # Post-response hook
-            logger.info(f"Response status: {response.status_code}")
-            
-            return response
-        return decorated_function
-    
-    return audit_middleware
-
-
-def create_app():
-    """Create and configure the Flask application.
+def create_app() -> Flask:
+    """
+    Create a Flask application for the PyGoop proxy.
     
     Returns:
-        A configured Flask application.
+        A Flask application instance.
     """
     app = Flask(__name__)
-    
-    # Configure engines
-    openai_engine = OpenAIEngine(api_key=os.environ.get('OPENAI_API_KEY'))
-    
-    azure_endpoint = os.environ.get('AZURE_OPENAI_ENDPOINT')
-    azure_engine = AzureOpenAIEngine(
-        endpoint=azure_endpoint if azure_endpoint else "https://example.openai.azure.com/",
-        api_key=os.environ.get('AZURE_OPENAI_API_KEY')
-    )
-    
-    bedrock_engine = BedrockEngine(
-        aws_region=os.environ.get('AWS_REGION', 'us-east-1'),
-        aws_access_key=os.environ.get('AWS_ACCESS_KEY_ID'),
-        aws_secret_key=os.environ.get('AWS_SECRET_ACCESS_KEY')
-    )
-    
-    vertex_engine = VertexAIEngine(
-        project_id=os.environ.get('GOOGLE_CLOUD_PROJECT', 'your-project-id')
-    )
-    
-    openai_proxy_engine = OpenAIProxyEngine({
-        'openai': openai_engine,
-        'azure': azure_engine,
-        'bedrock': bedrock_engine,
-        'vertex': vertex_engine
-    })
-    
-    # Apply middleware
-    audit_middleware = create_audit_middleware()
+    audit_logger = AuditLogger()
     
     @app.route('/')
     def index():
-        """Home page showing the API status."""
+        """
+        Root endpoint that returns information about the proxy.
+        
+        Returns:
+            JSON response with proxy information.
+        """
         return jsonify({
-            'status': 'ok',
-            'message': 'PyGoop - Python OpenLLM Proxy',
-            'endpoints': [
-                '/openai/...',
-                '/azure/...',
-                '/bedrock/...',
-                '/vertex/...',
-                '/openai-proxy/...'
-            ]
+            "name": "PyGoop OpenLLM Proxy",
+            "version": "0.1.0",
+            "description": "A reverse proxy for integrating multiple LLM providers",
+            "endpoints": list(PROVIDER_ENDPOINTS.keys()) + ["openai-proxy"],
+            "status": "running"
         })
     
-    @app.route('/openai/<path:subpath>', methods=['GET', 'POST', 'PUT', 'DELETE'])
-    @audit_middleware
-    def openai_proxy(subpath):
-        """Proxy requests to OpenAI API."""
-        response = openai_engine.proxy_request(
-            path=subpath,
-            method=request.method,
-            headers=request.headers,
-            data=request.get_json() if request.is_json else None,
-            stream=request.headers.get('Accept') == 'text/event-stream'
+    @app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH'])
+    def proxy(path: str) -> Response:
+        """
+        Proxy endpoint that handles all requests and routes them to the appropriate provider.
+        
+        Args:
+            path: The URL path.
+            
+        Returns:
+            The proxied response.
+        """
+        request_id = generate_request_id()
+        provider = get_provider_from_url(path)
+        
+        if not provider:
+            return jsonify({
+                'error': f"Invalid provider. URL path must start with one of: {', '.join(PROVIDER_ENDPOINTS.keys())}"
+            }), 400
+            
+        # Determine the target endpoint and request details
+        target_url, method, headers, data = prepare_request(provider, path, request)
+        
+        if provider == 'openai-proxy':
+            # Handle routing through the common OpenAI-compatible interface
+            return handle_openai_proxy_request(request_id, path, request)
+        
+        logger.info(f"Proxying {method} request to {target_url}")
+        
+        # Audit the request
+        audit_logger.log_request(
+            request_id=request_id,
+            provider=provider,
+            endpoint=path,
+            method=method,
+            data=filter_sensitive_data(data)
         )
         
-        if not response:
-            return jsonify({'error': 'Failed to proxy request to OpenAI API'}), 500
+        try:
+            # Check if it's a streaming request
+            is_streaming = check_streaming_request(data)
             
-        if response.headers.get('Content-Type') == 'text/event-stream':
-            # Handle streaming response
-            def generate():
-                for chunk in response.iter_lines():
-                    if chunk:
-                        yield chunk + b'\n'
-                        
-            return Response(
-                stream_with_context(generate()),
-                status=response.status_code,
-                content_type='text/event-stream'
+            if is_streaming:
+                return handle_streaming_request(request_id, provider, path, target_url, method, headers, data)
+            else:
+                return handle_standard_request(request_id, provider, path, target_url, method, headers, data)
+                
+        except Exception as e:
+            error_message = str(e)
+            logger.error(f"Error proxying request to {target_url}: {error_message}")
+            
+            # Audit the error
+            audit_logger.log_error(
+                request_id=request_id,
+                provider=provider,
+                endpoint=path,
+                error_message=error_message
             )
-        else:
-            # Regular response
-            return Response(
-                response=response.content,
-                status=response.status_code,
-                content_type=response.headers.get('Content-Type', 'application/json')
-            )
+            
+            return jsonify({
+                'error': error_message
+            }), 500
     
-    @app.route('/azure/<path:subpath>', methods=['GET', 'POST', 'PUT', 'DELETE'])
-    @audit_middleware
-    def azure_proxy(subpath):
-        """Proxy requests to Azure OpenAI API."""
-        response = azure_engine.proxy_request(
-            path=subpath,
-            method=request.method,
-            headers=request.headers,
-            data=request.get_json() if request.is_json else None,
-            stream=request.headers.get('Accept') == 'text/event-stream'
-        )
+    def prepare_request(provider: str, path: str, flask_request) -> Tuple[str, str, Dict[str, str], Dict[str, Any]]:
+        """
+        Prepare the request details for proxying.
         
-        if not response:
-            return jsonify({'error': 'Failed to proxy request to Azure OpenAI API'}), 500
+        Args:
+            provider: The LLM provider.
+            path: The URL path.
+            flask_request: The Flask request object.
             
-        if response.headers.get('Content-Type') == 'text/event-stream':
-            # Handle streaming response
-            def generate():
-                for chunk in response.iter_lines():
-                    if chunk:
-                        yield chunk + b'\n'
-                        
-            return Response(
-                stream_with_context(generate()),
-                status=response.status_code,
-                content_type='text/event-stream'
-            )
+        Returns:
+            A tuple of (target_url, method, headers, data).
+        """
+        # Remove the provider from the path
+        if '/' in path:
+            _, path_without_provider = path.split('/', 1)
         else:
-            # Regular response
-            return Response(
-                response=response.content,
-                status=response.status_code,
-                content_type=response.headers.get('Content-Type', 'application/json')
-            )
+            path_without_provider = ''
+            
+        # Build the target URL
+        base_url = PROVIDER_ENDPOINTS.get(provider)
+        target_url = f"{base_url}/{path_without_provider}"
+        
+        # Get the request method
+        method = flask_request.method
+        
+        # Copy the headers
+        headers = dict(flask_request.headers)
+        
+        # Provider-specific header modifications
+        if provider == 'openai':
+            if 'OPENAI_API_KEY' in os.environ:
+                headers['Authorization'] = f"Bearer {os.environ['OPENAI_API_KEY']}"
+        elif provider == 'azure':
+            if 'AZURE_OPENAI_API_KEY' in os.environ:
+                headers['api-key'] = os.environ['AZURE_OPENAI_API_KEY']
+            if 'AZURE_OPENAI_API_VERSION' in os.environ:
+                headers['api-version'] = os.environ['AZURE_OPENAI_API_VERSION']
+        elif provider == 'bedrock':
+            # AWS credentials are handled at the request level
+            pass
+        elif provider == 'vertex':
+            # Google credentials are handled at the request level
+            pass
+        
+        # Forward the Content-Type header if present
+        if 'Content-Type' not in headers:
+            headers['Content-Type'] = 'application/json'
+            
+        # Parse the request data
+        data = {}
+        if flask_request.data:
+            try:
+                data = json.loads(flask_request.data)
+            except json.JSONDecodeError:
+                data = {'raw': flask_request.data.decode('utf-8')}
+        
+        return target_url, method, headers, data
     
-    @app.route('/bedrock/<path:subpath>', methods=['GET', 'POST', 'PUT', 'DELETE'])
-    @audit_middleware
-    def bedrock_proxy(subpath):
-        """Proxy requests to AWS Bedrock API."""
-        response = bedrock_engine.proxy_request(
-            path=subpath,
-            method=request.method,
-            headers=request.headers,
-            data=request.get_json() if request.is_json else None,
-            stream=request.headers.get('Accept') == 'text/event-stream'
+    def check_streaming_request(data: Dict[str, Any]) -> bool:
+        """
+        Check if the request is for streaming.
+        
+        Args:
+            data: The request data.
+            
+        Returns:
+            True if the request is for streaming, False otherwise.
+        """
+        return data.get('stream', False)
+    
+    def handle_standard_request(
+        request_id: str,
+        provider: str,
+        path: str,
+        target_url: str,
+        method: str,
+        headers: Dict[str, str],
+        data: Dict[str, Any]
+    ) -> Response:
+        """
+        Handle a standard (non-streaming) request.
+        
+        Args:
+            request_id: The request ID.
+            provider: The LLM provider.
+            path: The URL path.
+            target_url: The target URL for the request.
+            method: The HTTP method.
+            headers: The request headers.
+            data: The request data.
+            
+        Returns:
+            The proxied response.
+        """
+        # Make the request to the provider
+        response = requests.request(
+            method=method,
+            url=target_url,
+            headers=headers,
+            json=data if headers.get('Content-Type') == 'application/json' else None,
+            data=data if headers.get('Content-Type') != 'application/json' else None,
+            stream=False
         )
         
-        if not response:
-            return jsonify({'error': 'Failed to proxy request to AWS Bedrock API'}), 500
+        # Parse the response
+        try:
+            response_data = response.json()
+        except json.JSONDecodeError:
+            response_data = {'raw': response.text}
             
-        # Handle the response similarly to other routes
+        # Audit the response
+        audit_logger.log_response(
+            request_id=request_id,
+            provider=provider,
+            endpoint=path,
+            status_code=response.status_code,
+            data=filter_sensitive_data(response_data)
+        )
+        
+        # Return the response
         return Response(
-            response=response.content,
+            json.dumps(response_data),
             status=response.status_code,
             content_type=response.headers.get('Content-Type', 'application/json')
         )
     
-    @app.route('/vertex/<path:subpath>', methods=['GET', 'POST', 'PUT', 'DELETE'])
-    @audit_middleware
-    def vertex_proxy(subpath):
-        """Proxy requests to Google Vertex AI API."""
-        response = vertex_engine.proxy_request(
-            path=subpath,
-            method=request.method,
-            headers=request.headers,
-            data=request.get_json() if request.is_json else None,
-            stream=request.headers.get('Accept') == 'text/event-stream'
+    def handle_streaming_request(
+        request_id: str,
+        provider: str,
+        path: str,
+        target_url: str,
+        method: str,
+        headers: Dict[str, str],
+        data: Dict[str, Any]
+    ) -> Response:
+        """
+        Handle a streaming request.
+        
+        Args:
+            request_id: The request ID.
+            provider: The LLM provider.
+            path: The URL path.
+            target_url: The target URL for the request.
+            method: The HTTP method.
+            headers: The request headers.
+            data: The request data.
+            
+        Returns:
+            The proxied streaming response.
+        """
+        # Make the request to the provider
+        response = requests.request(
+            method=method,
+            url=target_url,
+            headers=headers,
+            json=data if headers.get('Content-Type') == 'application/json' else None,
+            data=data if headers.get('Content-Type') != 'application/json' else None,
+            stream=True
         )
         
-        if not response:
-            return jsonify({'error': 'Failed to proxy request to Google Vertex AI API'}), 500
+        # Define the generator function for streaming
+        def generate():
+            for chunk in response.iter_lines(decode_unicode=True):
+                if chunk:
+                    # Yield the chunk
+                    yield f"data: {chunk}\n\n"
+                    
+                    # Try to parse the chunk for audit logging
+                    try:
+                        chunk_data = json.loads(chunk.replace('data: ', ''))
+                        # Audit the chunk (could be batched for performance)
+                        audit_logger.log_response(
+                            request_id=request_id,
+                            provider=provider,
+                            endpoint=path,
+                            status_code=response.status_code,
+                            data=filter_sensitive_data(chunk_data)
+                        )
+                    except (json.JSONDecodeError, ValueError):
+                        # Just log the raw chunk if can't parse
+                        pass
             
-        # Handle the response similarly to other routes
+            # End the stream
+            yield 'data: [DONE]\n\n'
+        
+        # Return the streaming response
         return Response(
-            response=response.content,
+            stream_with_context(generate()),
             status=response.status_code,
-            content_type=response.headers.get('Content-Type', 'application/json')
+            content_type='text/event-stream'
         )
     
-    @app.route('/openai-proxy/<path:subpath>', methods=['GET', 'POST', 'PUT', 'DELETE'])
-    @audit_middleware
-    def openai_compat_proxy(subpath):
-        """Proxy requests using OpenAI-compatible interface to other providers."""
-        response = openai_proxy_engine.proxy_request(
-            path=subpath,
-            method=request.method,
-            headers=request.headers,
-            data=request.get_json() if request.is_json else None,
-            stream=request.headers.get('Accept') == 'text/event-stream'
-        )
+    def handle_openai_proxy_request(
+        request_id: str,
+        path: str,
+        flask_request
+    ) -> Response:
+        """
+        Handle a request through the OpenAI-compatible proxy interface.
         
-        if isinstance(response, Response):
-            # The engine already created a Response object
-            return response
+        Args:
+            request_id: The request ID.
+            path: The URL path.
+            flask_request: The Flask request object.
             
-        if not response:
-            return jsonify({'error': 'Failed to proxy request'}), 500
+        Returns:
+            The proxied response.
+        """
+        logger.info(f"Handling OpenAI-compatible proxy request for {path}")
+        
+        # Parse the request data
+        data = {}
+        if flask_request.data:
+            try:
+                data = json.loads(flask_request.data)
+            except json.JSONDecodeError:
+                return jsonify({
+                    'error': 'Invalid JSON in request body'
+                }), 400
+        
+        # Extract the model parameter to determine the target provider
+        model = data.get('model', '')
+        
+        # Route based on the model prefix
+        if model.startswith('bedrock/'):
+            # Route to AWS Bedrock
+            bedrock_data = transform_openai_to_bedrock(data)
             
-        if response.headers.get('Content-Type') == 'text/event-stream':
-            # Handle streaming response
-            def generate():
-                for chunk in response.iter_lines():
-                    if chunk:
-                        yield chunk + b'\n'
-                        
-            return Response(
-                stream_with_context(generate()),
-                status=response.status_code,
-                content_type='text/event-stream'
+            # Remove the provider from the path
+            if '/' in path:
+                _, path_without_provider = path.split('/', 1)
+            else:
+                path_without_provider = ''
+                
+            # Build the target URL (simplified for example)
+            target_url = f"{PROVIDER_ENDPOINTS['bedrock']}/{path_without_provider}"
+            
+            # Make the request to Bedrock (simplified)
+            response = requests.post(
+                url=target_url,
+                headers={'Content-Type': 'application/json'},
+                json=bedrock_data
             )
+            
+            # Transform the response back to OpenAI format
+            try:
+                bedrock_response = response.json()
+                openai_response = transform_bedrock_to_openai(bedrock_response)
+                
+                return jsonify(openai_response)
+            except Exception as e:
+                return jsonify({
+                    'error': f"Error transforming Bedrock response: {str(e)}"
+                }), 500
+                
+        elif model.startswith('vertex/'):
+            # Route to Google Vertex AI
+            vertex_data = transform_openai_to_vertex(data)
+            
+            # Remove the provider from the path
+            if '/' in path:
+                _, path_without_provider = path.split('/', 1)
+            else:
+                path_without_provider = ''
+                
+            # Build the target URL (simplified for example)
+            target_url = f"{PROVIDER_ENDPOINTS['vertex']}/{path_without_provider}"
+            
+            # Make the request to Vertex AI (simplified)
+            response = requests.post(
+                url=target_url,
+                headers={'Content-Type': 'application/json'},
+                json=vertex_data
+            )
+            
+            # Transform the response back to OpenAI format
+            try:
+                vertex_response = response.json()
+                openai_response = transform_vertex_to_openai(vertex_response)
+                
+                return jsonify(openai_response)
+            except Exception as e:
+                return jsonify({
+                    'error': f"Error transforming Vertex AI response: {str(e)}"
+                }), 500
+                
         else:
-            # Regular response
-            return Response(
-                response=response.content,
-                status=response.status_code,
-                content_type=response.headers.get('Content-Type', 'application/json')
+            # Default to OpenAI
+            # Remove the provider from the path
+            if '/' in path:
+                _, path_without_provider = path.split('/', 1)
+            else:
+                path_without_provider = ''
+                
+            # Build the target URL
+            target_url = f"{PROVIDER_ENDPOINTS['openai']}/{path_without_provider}"
+            
+            # Copy the headers
+            headers = dict(flask_request.headers)
+            
+            # Add the OpenAI API key
+            if 'OPENAI_API_KEY' in os.environ:
+                headers['Authorization'] = f"Bearer {os.environ['OPENAI_API_KEY']}"
+            
+            # Make the request to OpenAI
+            response = requests.post(
+                url=target_url,
+                headers=headers,
+                json=data
             )
+            
+            # Return the response directly
+            try:
+                openai_response = response.json()
+                return jsonify(openai_response)
+            except json.JSONDecodeError:
+                return Response(
+                    response.text,
+                    status=response.status_code,
+                    content_type=response.headers.get('Content-Type', 'application/json')
+                )
     
     return app
