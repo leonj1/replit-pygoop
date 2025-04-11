@@ -1,27 +1,30 @@
 """
-PyGoop - A Python web crawler and scraping library
-================================================
+PyGoop - Python OpenLLM Proxy
+=============================
 
-PyGoop is a Python library inspired by the Golang 'goop' project.
-It provides a simple interface for crawling websites, extracting data,
-and processing the results.
+PyGoop is a Python implementation of the Golang 'goop' project.
+It provides a reverse proxy for integrating multiple LLM providers
+(OpenAI, Azure OpenAI, Vertex AI, Bedrock) into a single interface.
+
+Features:
+---------
+- Proxies multiple LLM providers at the network level
+- Dynamic routing based on URL prefixes
+- Common OpenAI-compatible interface for all providers
+- Support for pre and post-response hooks
+- Non-blocking streaming support (SSE)
+- Audit logging for requests and responses
 
 Basic usage:
 -----------
 
 ```python
-from pygoop.crawler import Crawler
+from pygoop.proxy import create_app
 
-# Create a crawler instance
-crawler = Crawler()
+# Create the proxy app
+app = create_app()
 
-# Start crawling from a URL
-results = crawler.crawl("https://example.com")
-
-# Process the results
-for result in results:
-    print(f"URL: {result.url}")
-    print(f"Title: {result.title}")
-    print(f"Content: {result.content[:100]}...")
+# Run the app
+app.run(host='0.0.0.0', port=8000)
 ```
 """
