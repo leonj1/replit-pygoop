@@ -446,3 +446,34 @@ def create_app() -> Flask:
                 )
     
     return app
+
+
+def main():
+    """
+    Main entry point for the PyGoop proxy server.
+    """
+    port = int(os.environ.get("PORT", 5000))
+    
+    # Print startup information
+    print("\nPyGoop OpenLLM Proxy Server")
+    print("==========================\n")
+    print(f"Server running at: http://localhost:{port}")
+    print("\nAvailable Endpoints:")
+    for provider, endpoint in PROVIDER_ENDPOINTS.items():
+        print(f"  /{provider}/... -> {endpoint}")
+    print(f"  /openai-proxy/... -> OpenAI-compatible interface for all providers")
+    
+    # API key warnings
+    if not os.environ.get("OPENAI_API_KEY"):
+        print("\nWarning: OPENAI_API_KEY environment variable is not set.")
+        print("OpenAI API calls will fail unless using a mock server.")
+    
+    print("\nUse examples/test_proxy.py to test the proxy server.\n")
+    
+    # Create and run the app
+    app = create_app()
+    app.run(host='0.0.0.0', port=port, debug=True)
+
+
+if __name__ == '__main__':
+    main()
