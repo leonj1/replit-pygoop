@@ -15,6 +15,7 @@ PyGoop is a Python-based reverse proxy for LLM APIs inspired by the Golang 'goop
 - Support for pre and post-response hooks for monitoring and logging
 - Proper handling of streaming responses (SSE)
 - Audit logging of requests and responses
+- OpenTelemetry instrumentation for metrics and monitoring
 
 ## Installation
 
@@ -109,3 +110,31 @@ Middleware dynamically routes requests based on URL prefixes to the appropriate 
 ### Pre and Post-Response Hooks
 
 Engines integrate with the audit package to log inline hooks on raw request/response structs. The proxy supports non-blocking SSE/streaming, and the post-response hook is triggered only after the client connection is closed.
+
+### Metrics and Monitoring with OpenTelemetry
+
+PyGoop includes OpenTelemetry instrumentation for collecting and exporting metrics:
+
+- Request counts by provider and endpoint
+- Request durations with detailed breakdowns
+- Success and error rates
+- Streaming vs. non-streaming request tracking
+
+Metrics are exposed via a Prometheus endpoint (default: http://localhost:8081/metrics) and can be visualized using tools like Grafana.
+
+#### Enabling OpenTelemetry
+
+```python
+from pygoop.proxy import create_app
+
+# Create the app with telemetry enabled (default)
+app = create_app(enable_telemetry=True, prometheus_port=8081)
+
+# Run the app
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
+```
+
+You can also configure OpenTelemetry via environment variables:
+- `ENABLE_TELEMETRY`: Set to "false" to disable telemetry (default: "true")
+- `PROMETHEUS_PORT`: Port for the Prometheus metrics endpoint (default: 8081)
